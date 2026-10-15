@@ -273,8 +273,14 @@ def _setting_value_details(value: Any) -> dict[str, Any]:
                     continue
                 scalar_parts.append(f"{_humanize_setting_name(key)}: {_normalize_policy_scalar(candidate)}")
             display = " | ".join(scalar_parts)
+            if not display and value:
+                # Future/unknown setting value shapes must still remain visible
+                # instead of becoming an empty matrix cell.
+                display = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
     elif isinstance(value, list):
         display = ", ".join(_normalize_policy_scalar(item) for item in value if item not in (None, ""))
+        if not display and value:
+            display = json.dumps(value, ensure_ascii=False, default=str)
     else:
         primary = value
         display = _normalize_policy_scalar(value)
@@ -335,6 +341,7 @@ def extract_policy_settings(
         value: Any,
         group: str = "",
         item_name: Any = "",
+        item_type: Any = "",
     ) -> None:
         raw_id = str(item_id or item_path.split(".")[-1]).strip()
         raw_name = str(item_name or "").strip()
@@ -349,25 +356,47 @@ def extract_policy_settings(
         )
         details = _setting_value_details(value)
         mapped = str(label.get("Mapping Status") or "") == "Mapped"
-        display_name = str(label.get("Display Name") or "").strip()
-        section = str(label.get("Section") or "").strip()
-        # The API already provides user-facing setting and section names. Use
-        # those names whenever no explicit override exists in the mapping file.
-        if not mapped and raw_name:
+        override_name = str(label.get("Display Name") or "").strip() if mapped else ""
+        override_section = str(label.get("Section") or "").strip() if mapped else ""
+        api_section = str(group or "").strip()
+
+        # API-first discovery: every setting returned by Falcon is included.
+        # Mapping is optional and can only override presentation/sort order; it
+        # is never a whitelist and therefore can never suppress a new API item.
+        if override_name:
+            display_name = override_name
+            display_source = "Custom override"
+        elif raw_name:
             display_name = raw_name
-        if not mapped and group:
-            section = str(group).strip()
+            display_source = "Falcon API"
+        else:
+            display_name = _humanize_setting_name(raw_id or item_path)
+            display_source = "Generated fallback"
+
+        if override_section:
+            section = override_section
+            section_source = "Custom override"
+        elif api_section:
+            section = api_section
+            section_source = "Falcon API"
+        else:
+            section = "Other"
+            section_source = "Generated fallback"
+
         rows.append(
             {
                 "Item Key": key,
                 "Item Path": item_path.strip("."),
                 "Setting ID": raw_id,
+                "Setting Type": str(item_type or "").strip(),
                 "Item Name": raw_name or raw_id,
-                "Display Name": display_name or _humanize_setting_name(raw_name or raw_id or item_path),
-                "Section": section or "Other",
+                "Display Name": display_name,
+                "Display Source": display_source,
+                "Section": section,
+                "Section Source": section_source,
                 "Sort Order": label["Sort Order"],
-                "Mapping Status": label["Mapping Status"],
-                "Group": group or label["Section"],
+                "Mapping Status": "Mapped" if mapped else "API native",
+                "Group": api_section or section,
                 **details,
             }
         )
@@ -383,7 +412,7 @@ def extract_policy_settings(
                     # "settings": [...]}. A section is not a configuration item;
                     # recurse into its settings and use the section name as group.
                     nested_settings = item.get("settings")
-                    if isinstance(nested_settings, list):
+                    if isinstance(nested_settings, (list, dict)):
                         section_group = str(item.get("name") or item_id or group).strip()
                         walk(nested_settings, f"{path}.{item_id}", section_group)
                     elif "value" in item:
@@ -393,6 +422,7 @@ def extract_policy_settings(
                             item.get("value"),
                             group,
                             item.get("name"),
+                            item.get("type"),
                         )
                     else:
                         payload = {k: v for k, v in item.items() if k not in {"id", "name", "setting_id", "description"}}
@@ -411,6 +441,7 @@ def extract_policy_settings(
                     node.get("value"),
                     group,
                     node.get("name"),
+                    node.get("type"),
                 )
                 return
 
@@ -439,17 +470,36 @@ def extract_policy_settings(
     for root_name, root in roots:
         walk(root, root_name)
 
-    # Prefer one row per setting key. Keep the first occurrence because API
-    # traversal is stable and duplicate helper paths may be present in combined
-    # and entity payloads after merge.
-    unique: list[dict[str, Any]] = []
-    seen: set[str] = set()
+    # Collapse exact duplicates created by merged/combined API payloads, but do
+    # not silently discard two real settings merely because they share an ID.
+    # If Falcon ever reuses an ID in different sections, make the key section-
+    # aware so both items remain visible in the matrix.
+    deduped: list[dict[str, Any]] = []
+    seen_signatures: set[tuple[str, str, str]] = set()
     for row in rows:
-        key = str(row.get("Item Key") or "")
-        if key and key not in seen:
-            seen.add(key)
-            unique.append(row)
-    return unique
+        signature = (
+            str(row.get("Item Key") or ""),
+            normalize_key(row.get("Section")),
+            str(row.get("Raw Value JSON") or ""),
+        )
+        if signature not in seen_signatures:
+            seen_signatures.add(signature)
+            deduped.append(row)
+
+    counts = Counter(str(row.get("Item Key") or "") for row in deduped)
+    used: set[str] = set()
+    for row in deduped:
+        base_key = str(row.get("Item Key") or "")
+        final_key = base_key
+        if counts.get(base_key, 0) > 1:
+            section_key = normalize_key(row.get("Section")) or "other"
+            final_key = f"{section_key}__{base_key}"
+            if final_key in used:
+                path_key = normalize_key(row.get("Item Path"))
+                final_key = f"{final_key}__{path_key}" if path_key else final_key
+        row["Item Key"] = final_key
+        used.add(final_key)
+    return deduped
 
 
 def normalize_policies(
@@ -465,11 +515,23 @@ def normalize_policies(
     for policy in policies:
         policy_id = str(policy.get("id") or policy.get("policy_id") or "")
         platform = normalize_platform(policy.get("platform_name") or policy.get("platform"))
-        raw_rows.append(flatten_json(policy))
         member_count = member_counts.get(policy_id, int(policy.get("_member_count_collected") or 0))
         enabled_value = policy.get("enabled")
         if enabled_value is None:
             enabled_value = policy.get("is_enabled")
+        # v15.2.1: only policies that actually protect at least one host are
+        # eligible for the PM matrix and compliance assessment. Empty policy
+        # groups would otherwise dilute/duplicate compliance results even though
+        # they have no operational impact. The original API response remains in
+        # Streamlit session state for rebuild/debug, but report-facing data skips it.
+        if member_count <= 0:
+            continue
+
+        # Only active policies are retained in report-facing raw data as well.
+        # The original API response remains available in session state for a
+        # rebuild/debug, but empty groups are intentionally absent from exports.
+        raw_rows.append(flatten_json(policy))
+
         policy_rows.append(
             {
                 "Policy ID": policy_id,
@@ -481,7 +543,7 @@ def normalize_policies(
                 "Created Timestamp": as_datetime(policy.get("created_timestamp")),
                 "Modified Timestamp": as_datetime(policy.get("modified_timestamp")),
                 "Member Count": member_count,
-                "Has Hosts": member_count > 0,
+                "Has Hosts": True,
             }
         )
         for setting in extract_policy_settings(policy, platform=platform, label_mapping=label_mapping):
@@ -492,13 +554,16 @@ def normalize_policies(
                     "Platform": platform,
                     "Policy Enabled": bool(enabled_value) if enabled_value is not None else None,
                     "Member Count": member_count,
-                    "Has Hosts": member_count > 0,
+                    "Has Hosts": True,
                     **setting,
                 }
             )
 
+    active_policy_ids = {str(row.get("Policy ID") or "") for row in policy_rows}
     member_rows: list[dict[str, Any]] = []
     for member in members:
+        if str(member.get("_policy_id") or "") not in active_policy_ids:
+            continue
         member_rows.append(
             {
                 "Policy ID": member.get("_policy_id") or "",
@@ -528,6 +593,25 @@ def _first_scalar(record: dict[str, Any], candidates: list[str], default: Any = 
     return pick(record, candidates, default)
 
 
+def _alert_severity_name(raw_name: Any, raw_score: Any) -> str:
+    text = str(raw_name or "").strip().replace("_", " ")
+    if text and not text.replace(".", "", 1).isdigit():
+        return text.title()
+    try:
+        score = float(raw_score if raw_score not in (None, "") else raw_name)
+    except (TypeError, ValueError):
+        return "Unknown"
+    if score >= 80:
+        return "Critical"
+    if score >= 60:
+        return "High"
+    if score >= 40:
+        return "Medium"
+    if score >= 20:
+        return "Low"
+    return "Informational"
+
+
 def normalize_alerts(records: list[dict[str, Any]]) -> tuple[pd.DataFrame, pd.DataFrame]:
     rows: list[dict[str, Any]] = []
     raw_rows: list[dict[str, Any]] = []
@@ -537,18 +621,22 @@ def normalize_alerts(records: list[dict[str, Any]]) -> tuple[pd.DataFrame, pd.Da
         behaviors = record.get("behaviors") if isinstance(record.get("behaviors"), list) else []
         behavior = behaviors[0] if behaviors and isinstance(behaviors[0], dict) else {}
         mitre = record.get("mitre_attack") if isinstance(record.get("mitre_attack"), dict) else {}
+        raw_severity_name = _first_scalar(record, ["severity_name", "max_severity_displayname", "behaviors.0.severity_name"], "")
+        raw_severity_score = _first_scalar(record, ["severity", "max_severity", "behaviors.0.severity"], None)
         rows.append(
             {
                 "Alert ID": _first_scalar(record, ["composite_id", "id", "alert_id"], ""),
                 "Created Timestamp": as_datetime(_first_scalar(record, ["created_timestamp", "created_time", "first_behavior"], None)),
                 "Updated Timestamp": as_datetime(_first_scalar(record, ["updated_timestamp", "updated_time", "last_behavior"], None)),
                 "Status": _first_scalar(record, ["status", "state"], "Unknown"),
-                "Severity": _first_scalar(record, ["severity_name", "severity", "max_severity_displayname", "max_severity"], "Unknown"),
-                "Severity Score": _first_scalar(record, ["severity", "max_severity"], None),
+                "Severity": raw_severity_score if raw_severity_score not in (None, "") else raw_severity_name,
+                "Severity Name": _alert_severity_name(raw_severity_name, raw_severity_score),
+                "Severity Score": raw_severity_score,
                 "Tactic": _first_scalar(record, ["tactic", "tactic_name", "mitre_attack.tactic", "behaviors.0.tactic"], behavior.get("tactic") or mitre.get("tactic") or "Unknown"),
                 "Technique": _first_scalar(record, ["technique", "technique_name", "mitre_attack.technique", "behaviors.0.technique"], behavior.get("technique") or mitre.get("technique") or "Unknown"),
                 "Hostname": _first_scalar(record, ["hostname", "device.hostname", "computer_name"], device.get("hostname") or "Unknown"),
                 "Device ID": _first_scalar(record, ["device_id", "device.device_id", "aid"], device.get("device_id") or ""),
+                "Agent ID": _first_scalar(record, ["agent_id", "agent_id_string", "device_id", "device.device_id", "aid"], device.get("device_id") or ""),
                 "Platform": normalize_platform(_first_scalar(record, ["platform", "platform_name", "device.platform_name"], device.get("platform_name") or "Unknown")),
                 "Username": _first_scalar(record, ["user_name", "username", "user.name", "behaviors.0.user_name"], behavior.get("user_name") or "Unknown"),
                 "File Name": _first_scalar(record, ["file_name", "filename", "behaviors.0.filename", "process.file_name"], behavior.get("filename") or "Unknown"),
@@ -556,7 +644,8 @@ def normalize_alerts(records: list[dict[str, Any]]) -> tuple[pd.DataFrame, pd.Da
                 "Command Line": _first_scalar(record, ["command_line", "behaviors.0.cmdline", "process.command_line"], behavior.get("cmdline") or ""),
                 "Product": _first_scalar(record, ["product", "product_name"], "Unknown"),
                 "Detection Type": _first_scalar(record, ["type", "detection_type", "alert_type"], "Unknown"),
-                "Description": _first_scalar(record, ["description", "scenario", "name"], ""),
+                "Detection Name": _first_scalar(record, ["name", "detect_name", "detection_name", "behaviors.0.name"], ""),
+                "Description": _first_scalar(record, ["description", "scenario", "behaviors.0.description", "name"], ""),
                 "Objective": _first_scalar(record, ["objective", "objective_name"], ""),
                 "Pattern ID": _first_scalar(record, ["pattern_id", "behaviors.0.pattern_id"], behavior.get("pattern_id") or ""),
                 "Hidden": _first_scalar(record, ["hidden", "is_hidden"], False),

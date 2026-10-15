@@ -10,8 +10,19 @@ MAPPING_COLUMNS = ["Platform", "Item Match", "Display Name", "Section", "Sort Or
 
 
 def normalize_key(value: Any) -> str:
-    text = str(value or "").strip().lower()
+    """Return a stable key for API IDs, paths, and optional override tokens.
+
+    CrowdStrike API IDs are commonly CamelCase (for example
+    ``DetectPackageOnWrite``), while older local override files often use
+    snake_case (``detect_package_on_write``).  Splitting CamelCase before
+    lower-casing makes both forms resolve to the same key without requiring a
+    static list of known settings.
+    """
+    text = str(value or "").strip()
     text = re.sub(r"\[[0-9]+\]", "", text)
+    text = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", text)
+    text = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", text)
+    text = text.lower()
     text = re.sub(r"[^a-z0-9]+", "_", text)
     return re.sub(r"_+", "_", text).strip("_")
 
@@ -54,8 +65,11 @@ def load_label_mapping(source: str | Path | pd.DataFrame | None) -> pd.DataFrame
     df = df[MAPPING_COLUMNS].copy()
     df["Platform"] = df["Platform"].fillna("All").astype(str).str.strip().replace("", "All")
     df["Item Match"] = df["Item Match"].fillna("").astype(str).str.strip()
+    # Display Name and Section are optional presentation overrides. Blank means
+    # "use the value supplied by the Falcon API"; they are never required for a
+    # setting to be discovered or included in the matrix.
     df["Display Name"] = df["Display Name"].fillna("").astype(str).str.strip()
-    df["Section"] = df["Section"].fillna("Other").astype(str).str.strip().replace("", "Other")
+    df["Section"] = df["Section"].fillna("").astype(str).str.strip()
     df["Sort Order"] = pd.to_numeric(df["Sort Order"], errors="coerce").fillna(9999).astype(int)
     return df[df["Item Match"].ne("")].reset_index(drop=True)
 
@@ -94,8 +108,10 @@ def resolve_setting_label(
             matches.sort(key=lambda item: (item[0], item[1]))
             rule = matches[0][2]
             return {
-                "Display Name": str(rule.get("Display Name") or humanize_setting_id(raw_id or raw_path)),
-                "Section": str(rule.get("Section") or "Other"),
+                # Empty values intentionally remain empty so the caller can
+                # fall back to Falcon's native name/section.
+                "Display Name": str(rule.get("Display Name") or "").strip(),
+                "Section": str(rule.get("Section") or "").strip(),
                 "Sort Order": int(rule.get("Sort Order") or 9999),
                 "Mapping Status": "Mapped",
             }
@@ -104,7 +120,7 @@ def resolve_setting_label(
         "Display Name": humanize_setting_id(raw_id or raw_path),
         "Section": "Other",
         "Sort Order": 9999,
-        "Mapping Status": "Humanized fallback",
+        "Mapping Status": "API native",
     }
 
 
@@ -163,12 +179,19 @@ def policy_matrix_dataframe(
     if policies is None or policies.empty:
         return pd.DataFrame()
     p = policies[policies["Platform"].eq(platform)].copy()
+    # v15.2.1: matrix/compliance views only include policies assigned to hosts.
+    if "Member Count" in p.columns:
+        p = p[pd.to_numeric(p["Member Count"], errors="coerce").fillna(0).gt(0)]
+    elif "Has Hosts" in p.columns:
+        p = p[p["Has Hosts"].eq(True)]
     if policy_ids:
         p = p[p["Policy ID"].astype(str).isin([str(value) for value in policy_ids])]
     if p.empty:
         return pd.DataFrame()
     p = p.sort_values(["Precedence", "Policy Name"], na_position="last").reset_index(drop=True)
     s = settings[settings["Platform"].eq(platform)].copy() if settings is not None and not settings.empty else pd.DataFrame()
+    if not s.empty and "Best Practice" not in s.columns:
+        s["Best Practice"] = ""
     policy_labels = _unique_policy_column_labels(p)
 
     rows: list[dict[str, Any]] = []
@@ -242,9 +265,17 @@ def disabled_items_summary(settings: pd.DataFrame) -> pd.DataFrame:
 
 
 def unmapped_items(settings: pd.DataFrame) -> pd.DataFrame:
+    """Return API-native items that do not have a custom display override.
+
+    Historical exports call this table "Unmapped Items" for compatibility, but
+    these rows are fully supported and are always included in the matrix.
+    """
+    columns = [
+        "Platform", "Setting ID", "Setting Type", "Item Path", "Display Name",
+        "Display Source", "Section", "Section Source", "Raw Value JSON",
+    ]
     if settings is None or settings.empty:
-        return pd.DataFrame(columns=["Platform", "Setting ID", "Item Path", "Display Name"])
-    result = settings[settings["Mapping Status"].ne("Mapped")][
-        ["Platform", "Setting ID", "Item Path", "Display Name", "Section", "Raw Value JSON"]
-    ].drop_duplicates()
+        return pd.DataFrame(columns=columns)
+    available = [column for column in columns if column in settings.columns]
+    result = settings[settings["Mapping Status"].ne("Mapped")][available].drop_duplicates()
     return result.sort_values(["Platform", "Display Name"]).reset_index(drop=True)

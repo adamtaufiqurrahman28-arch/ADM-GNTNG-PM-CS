@@ -36,7 +36,7 @@ class FalconConnection:
             "client_id": self.client_id,
             "client_secret": self.client_secret,
             "base_url": self.base_url,
-            "user_agent": "seraphim-falcon-data-collector/15.0.6.2",
+            "user_agent": "seraphim-falcon-data-collector/15.2.1",
         }
         if self.member_cid:
             kwargs["member_cid"] = self.member_cid

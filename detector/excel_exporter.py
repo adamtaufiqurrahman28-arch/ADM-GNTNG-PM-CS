@@ -24,9 +24,11 @@ DETAIL_COLUMNS = [
     "Technique",
     "Technique ID",
     "Objective",
+    "Detection Name",
     "Scenario",
     "Hostname",
     "Device ID",
+    "Agent ID",
     "Platform",
     "OS Version",
     "Local IP",
@@ -117,6 +119,8 @@ def _write_table_sheet(
         "Severity Name": 16,
         "Product": 20,
         "Detection Type": 24,
+        "Detection Name": 38,
+        "Agent ID": 36,
         "Tactic": 25,
         "Technique": 34,
         "Hostname": 24,
@@ -240,6 +244,11 @@ def build_detection_workbook(
     summary.merge_range(kpi_row, 1, kpi_row, 5, "", section_fmt)
     kpis = [
         ("Total Alerts", analytics["total"], integer_fmt),
+        ("Critical", analytics["critical_count"], integer_fmt),
+        ("High", analytics["high_count"], integer_fmt),
+        ("Medium", analytics["medium_count"], integer_fmt),
+        ("Host — Take Care", analytics["take_care_hosts"], integer_fmt),
+        ("Host — Review", analytics["review_hosts"], integer_fmt),
         ("New/Open", analytics["new"], integer_fmt),
         ("In Progress", in_progress, integer_fmt),
         ("Reopened", reopened, integer_fmt),
@@ -265,6 +274,17 @@ def build_detection_workbook(
     _write_table_sheet(workbook, "Alerts Detail", records, columns=detail_columns)
     _write_table_sheet(workbook, "By Status", analytics["status"])
     _write_table_sheet(workbook, "By Severity", analytics["severity"])
+
+    # Severity-correlated analytical views. The FQL/API layer only collects and
+    # filters records; these aggregations intentionally run locally in Python so
+    # customers do not require CQL/NGSIEM for the report logic.
+    _write_table_sheet(workbook, "Tactic-Tech Severity", analytics["tactic_technique_by_severity"])
+    _write_table_sheet(workbook, "Host Requiring Attention", analytics["host_requiring_attention"])
+    _write_table_sheet(workbook, "Unique Detection per Host", analytics["unique_detection_per_host"])
+    _write_table_sheet(workbook, "Unique Tactic-Technique", analytics["unique_tactic_technique_by_severity"])
+    _write_table_sheet(workbook, "Critical Investigation", analytics["critical_investigation"])
+
+    # Legacy quantitative sheets are retained for continuity with earlier PM exports.
     _write_table_sheet(workbook, "By Product", count_by(records, "Product"))
     _write_table_sheet(
         workbook, "By Detection Type", count_by(records, "Detection Type")

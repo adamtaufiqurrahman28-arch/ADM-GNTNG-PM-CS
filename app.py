@@ -42,7 +42,7 @@ APP_DIR = Path(__file__).parent
 DATA_DIR = APP_DIR / "data"
 
 st.set_page_config(
-    page_title="Seraphim Falcon Data Collector v15.0.6.2",
+    page_title="Seraphim Falcon Data Collector v15.2.1",
     page_icon="🛡️",
     layout="wide",
 )
@@ -96,8 +96,11 @@ def init_state() -> None:
         "policy_groups": pd.DataFrame(),
         "policy_source_records": [],
         "policy_source_members": [],
-        "policy_label_mapping": load_label_mapping(DATA_DIR / "policy_setting_labels.csv"),
-        "policy_label_mapping_input": load_label_mapping(DATA_DIR / "policy_setting_labels.csv"),
+        # Prevention Policy discovery is API-native by default. Optional label
+        # overrides can be loaded/edited later, but they are never required for
+        # a setting to appear in the matrix.
+        "policy_label_mapping": load_label_mapping(None),
+        "policy_label_mapping_input": load_label_mapping(None),
         "policy_members": pd.DataFrame(),
         "policy_settings": pd.DataFrame(),
         "policy_raw": pd.DataFrame(),
@@ -218,7 +221,7 @@ def load_offline_demo() -> None:
 init_state()
 
 st.markdown(
-    '<div class="hero"><h1>Seraphim Falcon Data Collector v15.0.6.2</h1><p>Menghasilkan tiga lampiran PM: Host & Sensor Health, Prevention Policy, dan Detection Alerts API. Prevention Policy kini menampilkan satu baris per configuration item, matrix policy, serta daftar item OFF/disabled.</p></div>',
+    '<div class="hero"><h1>Seraphim Falcon Data Collector v15.2.1</h1><p>Menghasilkan tiga lampiran PM: Host & Sensor Health, Prevention Policy, dan Detection Alerts API. Prevention Policy auto-discovers configuration items dari Falcon API. Detection memakai FQL/Alerts API untuk collection dan Python severity correlation untuk analytics tanpa CQL/NGSIEM.</p></div>',
     unsafe_allow_html=True,
 )
 
@@ -430,17 +433,18 @@ elif step == "3. Sensor Health":
 elif step == "4. Prevention Policy":
     st.subheader("4. Prevention Policy")
     st.caption(
-        "API mengambil policy group, jumlah host/member, dan settings. Engine v15.0.6 "
-        "mengubah settings[].id + settings[].value menjadi satu baris Configuration Item. "
-        "Type, Value, Detection, dan Prevention tidak lagi muncul sebagai baris terpisah."
+        "Dynamic API discovery v15.2.1: semua section dan configuration item yang dikirim Falcon API "
+        "otomatis masuk matrix. Tidak ada whitelist/static daftar setting. Policy dengan 0 host otomatis diabaikan. "
+        "Best Practice juga dibuat otomatis (ON / minimum MODERATE++). Optional Display Overrides hanya mengubah "
+        "nama/section/sort order dan tidak pernah menentukan apakah item boleh tampil."
     )
 
     policy_filter = st.text_input("Policy FQL Filter (opsional)", value="")
 
-    with st.expander("Configuration Item Label Mapping", expanded=False):
+    with st.expander("Optional Display Overrides (tidak wajib)", expanded=False):
         st.info(
-            "Mapping ini mengubah API setting ID menjadi nama item yang mudah dibaca. "
-            "Item yang belum dikenal tetap ditampilkan menggunakan humanized fallback dan masuk tab Unmapped Items."
+            "Source of truth adalah Falcon API. Tanpa override pun semua setting baru otomatis muncul. "
+            "Override hanya dipakai jika Anda ingin mengganti display name, section, atau urutan tampilan."
         )
         edited_mapping = st.data_editor(
             st.session_state["policy_label_mapping_input"],
@@ -453,7 +457,7 @@ elif step == "4. Prevention Policy":
                     "Platform", options=["All", "Windows", "Mac", "Linux"], required=True
                 ),
                 "Item Match": st.column_config.TextColumn("API ID / Match", required=True),
-                "Display Name": st.column_config.TextColumn("Configuration Item", required=True),
+                "Display Name": st.column_config.TextColumn("Configuration Item Override (optional)", required=False),
                 "Section": st.column_config.TextColumn("Section"),
                 "Sort Order": st.column_config.NumberColumn("Sort Order", min_value=0, step=10),
             },
@@ -467,7 +471,7 @@ elif step == "4. Prevention Policy":
                 st.success(f"Mapping tersimpan di session: {len(mapping):,} rule.")
             except Exception as exc:
                 st.error(str(exc))
-        if map_c2.button("Reset Built-in Mapping", use_container_width=True):
+        if map_c2.button("Load Legacy Display Overrides", use_container_width=True):
             mapping = load_label_mapping(DATA_DIR / "policy_setting_labels.csv")
             st.session_state["policy_label_mapping"] = mapping
             st.session_state["policy_label_mapping_input"] = mapping
@@ -478,14 +482,18 @@ elif step == "4. Prevention Policy":
         "Baseline Best Practice (opsional: CSV/XLSX)",
         type=["csv", "xlsx"],
         help=(
-            "Tanpa baseline, aplikasi tetap menampilkan seluruh item OFF/disabled. "
-            "Dengan baseline, aplikasi juga menilai Compliant, Not Compliant, atau Excluded."
+            "Best Practice bawaan selalu aktif dan dibuat dinamis: toggle = ON, level/ML = minimum MODERATE++. "
+            "File yang di-upload bersifat optional override untuk item tertentu."
         ),
+    )
+    st.info(
+        "Best Practice otomatis v15.2.1: semua toggle/protection = ON; setting level/ML = minimum MODERATE++. "
+        "Policy group dengan 0 host otomatis diabaikan agar tidak memengaruhi compliance."
     )
     if baseline_upload is not None:
         try:
             st.session_state["policy_baseline"] = load_baseline(read_uploaded_table(baseline_upload))
-            st.success(f"Baseline terbaca: {len(st.session_state['policy_baseline']):,} rule.")
+            st.success(f"Baseline override terbaca: {len(st.session_state['policy_baseline']):,} rule. Default ON/MODERATE++ tetap berlaku untuk item lain.")
         except Exception as exc:
             st.error(str(exc))
 
@@ -516,14 +524,18 @@ elif step == "4. Prevention Policy":
             st.session_state["policy_metadata"] = {
                 **policy_result.metadata,
                 "member_records": len(members),
-                "baseline_rules": len(st.session_state["policy_baseline"]),
-                "mapping_rules": len(current_mapping),
-                "normalizer": "v15.0.6 one-setting-one-row",
+                "baseline_override_rules": len(st.session_state["policy_baseline"]),
+                "best_practice_mode": "Dynamic default: toggle=ON; level/ML>=MODERATE++",
+                "active_policy_only": True,
+                "ignored_zero_host_policy_groups": max(len(policy_result.records) - len(groups), 0),
+                "display_override_rules": len(current_mapping),
+                "discovery_mode": "Dynamic Falcon API discovery",
+                "normalizer": "v15.2.1 API-first dynamic settings + active-policy filter",
             }
             reset_exports()
             st.success(
-                f"Berhasil menarik {len(groups):,} policy group, {len(members):,} membership record, "
-                f"dan {len(settings):,} configuration record."
+                f"Berhasil memproses {len(groups):,} policy group aktif (host > 0), {len(members):,} membership record, "
+                f"dan {len(settings):,} configuration record. Policy group kosong tidak masuk compliance."
             )
         except Exception as exc:
             st.exception(exc)
@@ -550,8 +562,12 @@ elif step == "4. Prevention Policy":
             st.session_state["policy_raw"] = raw
             st.session_state["policy_metadata"] = {
                 **st.session_state.get("policy_metadata", {}),
-                "mapping_rules": len(current_mapping),
-                "normalizer": "v15.0.6 one-setting-one-row",
+                "baseline_override_rules": len(st.session_state["policy_baseline"]),
+                "best_practice_mode": "Dynamic default: toggle=ON; level/ML>=MODERATE++",
+                "active_policy_only": True,
+                "display_override_rules": len(current_mapping),
+                "discovery_mode": "Dynamic Falcon API discovery",
+                "normalizer": "v15.2.1 API-first dynamic settings + active-policy filter",
             }
             reset_exports()
             st.success("Matrix dibangun ulang menggunakan mapping terbaru.")
@@ -569,7 +585,7 @@ elif step == "4. Prevention Policy":
         m2.metric("Enabled Groups", f"{groups['Enabled'].eq(True).sum():,}")
         m3.metric("Groups with Hosts", f"{groups['Has Hosts'].eq(True).sum():,}")
         m4.metric("Disabled Items", f"{len(disabled):,}")
-        m5.metric("Unmapped Labels", f"{len(unmapped):,}")
+        m5.metric("API-native / No Override", f"{len(unmapped):,}")
         st.dataframe(summary, use_container_width=True)
 
         platform_tabs = st.tabs(["Windows Matrix", "Linux Matrix", "Mac Matrix"])
@@ -608,7 +624,7 @@ elif step == "4. Prevention Policy":
             "Not Compliant",
             "Policy Members",
             "All Settings",
-            "Unmapped Items",
+            "No Display Override",
         ])
         tabs[0].dataframe(groups, use_container_width=True, height=420)
         tabs[1].dataframe(disabled, use_container_width=True, height=500)
@@ -623,14 +639,15 @@ elif step == "4. Prevention Policy":
         tabs[5].dataframe(unmapped, use_container_width=True, height=500)
 
 elif step == "5. Detection Alerts":
-    st.subheader("5. Detection — Standalone Alerts API Flow")
+    st.subheader("5. Detection — FQL Collection + Severity Correlation")
     st.success(
-        "Detection sekarang memakai flow yang sama dengan "
-        "seraphim_detection_export_standalone_v1.0.0 yang sudah running."
+        "Collection tetap memakai standalone Falcon Alerts API + FQL. Korelasi severity, scoring, "
+        "unique detection, repetition ratio, dan priority dihitung lokal di Python — tanpa CQL/NGSIEM."
     )
     st.caption(
-        "FalconPy Alerts.get_alerts_combined → FQL periode → pagination token after → "
-        "normalisasi standalone. Tidak memakai Query V2, expected-total preflight, CQL, atau NGSIEM."
+        "FalconPy Alerts.get_alerts_combined → FQL periode/filter → pagination token after → "
+        "normalisasi → Python analytics. FQL dipakai untuk collection/filtering; aggregation dan "
+        "severity correlation tidak membutuhkan CQL."
     )
 
     c1, c2, c3 = st.columns(3)
@@ -725,16 +742,52 @@ elif step == "5. Detection Alerts":
 
     alerts = st.session_state["alerts_report"]
     if not alerts.empty:
-        summary = alert_summary(alerts, st.session_state["alert_metadata"])
-        st.dataframe(summary, use_container_width=True)
         tables = alert_tables(alerts, top_n=10)
-        tabs = st.tabs(["Status", "Severity", "Tactic", "Technique", "Host", "Detail"])
-        tabs[0].dataframe(tables["By Status"], use_container_width=True)
-        tabs[1].dataframe(tables["By Severity"], use_container_width=True)
-        tabs[2].dataframe(tables["Top Tactic"], use_container_width=True)
-        tabs[3].dataframe(tables["Top Technique"], use_container_width=True)
-        tabs[4].dataframe(tables["Top Host"], use_container_width=True)
-        tabs[5].dataframe(alerts, use_container_width=True, height=500)
+        summary = alert_summary(alerts, st.session_state["alert_metadata"])
+
+        severity = tables["By Severity"]
+        severity_lookup = (
+            severity.set_index("Severity Name")["Detection Count"].to_dict()
+            if not severity.empty and {"Severity Name", "Detection Count"}.issubset(severity.columns)
+            else {}
+        )
+        host_attention = tables["Host Requiring Attention"]
+        take_care_hosts = (
+            int(host_attention["Priority"].eq("Take Care").sum())
+            if not host_attention.empty and "Priority" in host_attention.columns
+            else 0
+        )
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Critical", f"{int(severity_lookup.get('Critical', 0)):,}")
+        m2.metric("High", f"{int(severity_lookup.get('High', 0)):,}")
+        m3.metric("Medium", f"{int(severity_lookup.get('Medium', 0)):,}")
+        m4.metric("Host — Take Care", f"{take_care_hosts:,}")
+
+        st.dataframe(summary, use_container_width=True)
+        tabs = st.tabs([
+            "Severity",
+            "Tactic × Technique",
+            "Host Attention",
+            "Unique / Host",
+            "Unique Tactic-Tech",
+            "Critical Investigation",
+            "Status",
+            "All Alerts",
+        ])
+        tabs[0].dataframe(tables["By Severity"], use_container_width=True, height=420)
+        tabs[1].dataframe(tables["Tactic & Technique by Severity"], use_container_width=True, height=500)
+        tabs[2].dataframe(tables["Host Requiring Attention"], use_container_width=True, height=500)
+        tabs[3].dataframe(tables["Unique Detection per Host"], use_container_width=True, height=500)
+        tabs[4].dataframe(tables["Unique Tactic & Technique by Severity"], use_container_width=True, height=500)
+        tabs[5].dataframe(tables["Critical Detection Investigation"], use_container_width=True, height=500)
+        tabs[6].dataframe(tables["By Status"], use_container_width=True, height=420)
+        tabs[7].dataframe(alerts, use_container_width=True, height=500)
+
+        with st.expander("Legacy quantitative Top-N views", expanded=False):
+            q1, q2, q3 = st.tabs(["Top Host", "Top Tactic", "Top Technique"])
+            q1.dataframe(tables["Top Host"], use_container_width=True)
+            q2.dataframe(tables["Top Tactic"], use_container_width=True)
+            q3.dataframe(tables["Top Technique"], use_container_width=True)
 
 elif step == "6. Validate Data":
     st.subheader("6. Data Validation")
@@ -824,9 +877,10 @@ elif step == "7. Export Excel":
                 counts=counts,
             )
             package_files["README.txt"] = (
-                "Seraphim Falcon Data Collector v15.0.6.2\n"
+                "Seraphim Falcon Data Collector v15.2.1\n"
                 "Paket berisi tiga lampiran PM: Host & Sensor Health, Prevention Policy, dan Detection Alerts API.\n"
-                "Sensor Matrix diinput langsung melalui tabel aplikasi. Detection memakai flow standalone Alerts API.\n"
+                "Sensor Matrix default sudah direfresh dan tetap editable. Detection memakai Alerts API + FQL untuk collection dan Python severity correlation tanpa CQL/NGSIEM.\n"
+                "Prevention Policy hanya menilai policy dengan host > 0. Best Practice default dinamis: toggle=ON, level/ML minimum MODERATE++.\n"
                 "Credential CrowdStrike tidak disimpan pada output.\n"
             ).encode("utf-8")
             exports = dict(excel_files)

@@ -550,6 +550,20 @@ def build_policy_workbook(
     members = _safe_df(members)
     settings = _safe_df(assessed_settings)
     raw_policies = _safe_df(raw_policies)
+
+    # v15.2.1: only Prevention Policy groups with at least one assigned host
+    # participate in the PM matrix and compliance result. Raw API rows are kept
+    # untouched for audit/debugging.
+    if not policies.empty:
+        if "Member Count" in policies.columns:
+            policies = policies[pd.to_numeric(policies["Member Count"], errors="coerce").fillna(0).gt(0)].copy()
+        elif "Has Hosts" in policies.columns:
+            policies = policies[policies["Has Hosts"].eq(True)].copy()
+    active_policy_ids = set(policies.get("Policy ID", pd.Series(dtype=str)).astype(str)) if not policies.empty else set()
+    if not members.empty and "Policy ID" in members.columns:
+        members = members[members["Policy ID"].astype(str).isin(active_policy_ids)].copy()
+    if not settings.empty and "Policy ID" in settings.columns:
+        settings = settings[settings["Policy ID"].astype(str).isin(active_policy_ids)].copy()
     output = BytesIO()
     workbook = xlsxwriter.Workbook(output, {"in_memory": True})
     workbook.set_properties(
@@ -615,8 +629,9 @@ def build_policy_workbook(
         ("Policy Members", len(members)),
         ("Configuration Records", len(settings)),
         ("Disabled Configuration Records", int(settings["Configuration Status"].eq("Disabled").sum()) if not settings.empty else 0),
-        ("Mapped Labels", int(settings["Mapping Status"].eq("Mapped").sum()) if not settings.empty and "Mapping Status" in settings else 0),
-        ("Humanized Fallback Labels", int(settings["Mapping Status"].ne("Mapped").sum()) if not settings.empty and "Mapping Status" in settings else 0),
+        ("Dynamic Discovery", metadata.get("discovery_mode") or "Falcon API settings discovered automatically"),
+        ("Custom Display Overrides", int(settings["Mapping Status"].eq("Mapped").sum()) if not settings.empty and "Mapping Status" in settings else 0),
+        ("API-native / No Override", int(settings["Mapping Status"].ne("Mapped").sum()) if not settings.empty and "Mapping Status" in settings else 0),
     ]
     for row_idx, (label, value) in enumerate(info, start=2):
         ws.write(row_idx, 0, label, table_fmt["label"])
@@ -823,8 +838,8 @@ def build_policy_workbook(
     detail_columns = [
         "Platform", "Policy Name", "Policy Enabled", "Member Count", "Has Hosts", "Section",
         "Display Name", "Display Value", "Configuration Status", "Best Practice", "Baseline Status",
-        "Assessment Reason", "Setting ID", "Item Path", "Value Type", "Detection Value",
-        "Prevention Value", "Mapping Status", "Raw Value JSON",
+        "Assessment Reason", "Setting ID", "Setting Type", "Item Path", "Value Type", "Detection Value",
+        "Prevention Value", "Display Source", "Section Source", "Mapping Status", "Raw Value JSON",
     ]
     detail = settings.copy()
     for column in detail_columns:
@@ -901,7 +916,7 @@ def manifest_json(
 ) -> bytes:
     payload = {
         "application": "Seraphim Falcon Data Collector",
-        "version": "15.0.6.2-data-collector",
+        "version": "15.2.1-active-policy-auto-baseline",
         "customer_name": customer_name,
         "connection": connection_safe,
         "host_collection": host_metadata,

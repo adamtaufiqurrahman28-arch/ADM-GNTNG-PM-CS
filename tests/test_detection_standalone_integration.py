@@ -67,6 +67,8 @@ def test_standalone_flow_is_used_end_to_end() -> None:
     report, raw = normalize_alerts_standalone(collected.alerts)
     assert report.loc[0, "Hostname"] == "HOST-01"
     assert report.loc[0, "Severity Name"] == "Critical"
+    assert "Detection Name" in report.columns
+    assert "Agent ID" in report.columns
     assert len(raw) == 2
 
     workbook = build_alert_workbook(
